@@ -274,4 +274,75 @@ async def debug_futbin():
         return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    
+    import os
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# ⬇️ novo
+from futbin_client import FutbinClient
+
+app = FastAPI(title="EA Trader AI – Analyst")
+
+# ====== ENV VARS obrigatórias/úteis ======
+TELEGRAM_API = os.getenv("TELEGRAM_API")  # já usas isto
+FUTBIN_USER = os.getenv("FUTBIN_USER")
+FUTBIN_PASS = os.getenv("FUTBIN_PASS")
+FUTBIN_PHPSESSID = os.getenv("FUTBIN_PHPSESSID")  # opcional: se quiseres continuar a usar cookie direto
+
+# Cliente Futbin (username/password OU cookie)
+futbin = FutbinClient(username=FUTBIN_USER, password=FUTBIN_PASS, phpsessid=FUTBIN_PHPSESSID)
+
+# ====== SCHEDULER ======
+scheduler = AsyncIOScheduler()
+
+async def analyze_job():
+    """
+    Job que corre de X em X minutos: garante login e faz uma chamada simples ao Futbin.
+    Aqui podes substituir pela tua análise (raspagem, cálculo, sinais, etc).
+    """
+    # Garante login (se tiver cookie ou já estiver logado, não faz nada)
+    login_info = futbin.login()
+
+    # Exemplo de chamada: homepage (como teste de “vida”)
+    r = futbin.get("/")
+    ok = r.status_code == 200
+
+    return {
+        "login_ok": login_info.get("ok"),
+        "http_ok": ok,
+        "status": r.status_code,
+    }
+
+# arranque do scheduler (10 min)
+scheduler.add_job(analyze_job, "interval", minutes=10, id="market_analysis", replace_existing=True)
+scheduler.start()
+
+# ====== ROTAS AUXILIARES ======
+@app.get("/")
+async def root():
+    return {"ok": True, "msg": "EA Trader AI – Analyst is running."}
+
+@app.get("/futbin/test")
+async def futbin_test():
+    """
+    Testa o login e devolve um pequeno resumo.
+    """
+    info = futbin.login()
+    test = futbin.get("/")
+    return JSONResponse({
+        "login": info,
+        "home_status": test.status_code,
+        "final_url": str(test.url),
+    })
+
+@app.get("/futbin/login")
+async def futbin_login():
+    """
+    Força novo login (útil para debugging).
+    """
+    futbin.scraper.cookies.clear()  # limpa cookies e força relogin
+    info = futbin.login()
+    return JSONResponse(info)
+
+# (Mantém as tuas rotas /webhook do Telegram, /status, etc.)
