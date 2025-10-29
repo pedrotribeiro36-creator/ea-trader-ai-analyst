@@ -1,14 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
+aiohttp
 requests
 beautifulsoup4
 lxml
-feedparser
 apscheduler
-python-dotenv
-feedparser==6.0.11
-requests==2.32.3
-beautifulsoup4==4.12.3
-pandas==2.2.2
-numpy==1.26.4
-APScheduler==3.10.4
