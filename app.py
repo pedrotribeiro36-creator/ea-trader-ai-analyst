@@ -1,333 +1,154 @@
-# app.py — EA Trader AI (tudo num único ficheiro)
-import os, re, time, json, asyncio, requests
-from typing import Dict, List, Tuple, Set
-from fastapi import FastAPI, Request, HTTPException
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from bs4 import BeautifulSoup
-import feedparser
+# app.py
+import os, json, asyncio, logging
+from typing import Dict, Any, List
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import aiohttp
 
-# ======================
-# CONFIG / ENV VARS
-# ======================
-TOKEN = os.environ.get("TELEGRAM_TOKEN")  # OBRIGATÓRIA
-if not TOKEN:
-    raise RuntimeError("Falta a variável de ambiente TELEGRAM_TOKEN!")
+from scheduler import start_scheduler, stop_scheduler, get_scheduler_status
+from market_analyzer import analyze_market, build_signal_message
+from x_fetcher import fetch_latest_posts
 
-API = f"https://api.telegram.org/bot{TOKEN}"
-PLATFORM = os.environ.get("PLATFORM", "ps").lower()        # ps | xbox | pc
-INTERVAL_MIN = int(os.environ.get("ALERT_INTERVAL_MIN", "10"))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ea-bot")
 
-# Fontes RSS (podes editar via ENV: RSS_SOURCES)
-DEFAULT_RSS = [
-    "https://nitter.net/FutSheriff/rss",
-    "https://nitter.net/FUTScoreboard/rss",
-    "https://nitter.net/EASPORTSFC/rss",
-]
-RSS_SOURCES = [
-    s.strip() for s in os.environ.get("RSS_SOURCES", ",".join(DEFAULT_RSS)).split(",")
-    if s.strip()
-]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+BOT_USERNAME   = os.environ.get("BOT_USERNAME", "")
+PUBLIC_URL     = os.environ["PUBLIC_URL"].rstrip("/")
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# ======================
-# APP + ESTADO
-# ======================
-app = FastAPI()
-scheduler = AsyncIOScheduler()
+SUBS_FILE = "subs.json"  # subs armazenadas em disco (persistem entre restarts do Render)
 
-SUBS_FILE = "subscribers.json"
-SEEN_FILE = "seen.json"
-subs: Set[int] = set()
-seen_links: Set[str] = set()
+app = FastAPI(title="EA Trader AI – Analyst")
 
-def load_state():
-    global subs, seen_links
+# ---------- helpers ----------
+def load_subs() -> List[int]:
     try:
-        subs = set(json.load(open(SUBS_FILE)))
+        with open(SUBS_FILE, "r") as f:
+            return json.load(f)
     except Exception:
-        subs = set()
-    try:
-        seen_links = set(json.load(open(SEEN_FILE)))
-    except Exception:
-        seen_links = set()
+        return []
 
-def save_state():
+def save_subs(subs: List[int]) -> None:
     try:
-        json.dump(list(subs), open(SUBS_FILE, "w"))
-        json.dump(list(seen_links), open(SEEN_FILE, "w"))
-    except Exception:
-        pass
-
-# ======================
-# TELEGRAM HELPERS
-# ======================
-def tg_send(chat_id: int, text: str, parse: str | None = "HTML", preview: bool = True):
-    try:
-        requests.post(
-            f"{API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse,
-                "disable_web_page_preview": preview,
-            },
-            timeout=20,
-        )
+        with open(SUBS_FILE, "w") as f:
+            json.dump(subs, f)
     except Exception as e:
-        print("tg_send error:", e)
+        logger.warning(f"Erro a gravar subs: {e}")
 
-# ======================
-# HYPES (RSS do X via Nitter)
-# ======================
-HYPE_KEYWORDS = [
-    r"\bSBC\b", r"\bLeak", r"Upgrade", r"Player\s*Pick", r"Objective",
-    r"\bPromo\b", r"\bTOTW\b", r"End of an Era", r"Flash", r"Loan", r"Icon"
-]
-KW_RE = re.compile("|".join(HYPE_KEYWORDS), re.IGNORECASE)
+async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{TG_API}/{method}"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+        async with s.post(url, json=payload) as r:
+            data = await r.json()
+            if not data.get("ok"):
+                logger.warning(f"Telegram API erro: {data}")
+            return data
 
-def classify_hype(text: str) -> str:
-    if not text:
-        return "low"
-    hits = len(KW_RE.findall(text))
-    if hits >= 3: return "high"
-    if hits == 2: return "medium"
-    return "low"
+async def send_message(chat_id: int, text: str, parse="Markdown"):
+    return await tg_call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": parse})
 
-def fetch_rss_items() -> List[dict]:
-    items: List[dict] = []
-    for url in RSS_SOURCES:
-        try:
-            feed = feedparser.parse(url)
-            src = feed.feed.get("title", url)
-            for e in feed.entries[:12]:
-                title = e.get("title", "")
-                summary = e.get("summary", "")
-                link = e.get("link", "")
-                pub = e.get("published_parsed") or e.get("updated_parsed")
-                ts = time.mktime(pub) if pub else time.time()
-                level = classify_hype(f"{title} {summary}")
-                items.append({
-                    "source": src, "title": title, "summary": summary,
-                    "link": link, "published": ts, "level": level
-                })
-        except Exception as ex:
-            print("RSS error:", url, ex)
-            continue
-    items.sort(key=lambda x: x["published"], reverse=True)
-    return items
+async def broadcast(text: str):
+    subs = load_subs()
+    if not subs:
+        logger.info("Sem subscritores ainda.")
+        return
+    await asyncio.gather(*[send_message(cid, text) for cid in subs])
 
-# ======================
-# MERCADO (Futbin - leitura best-effort)
-# ======================
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-# Página agregada com preços; serve para fallback robusto
-FUTBIN_FODDER = "https://www.futbin.com/stc/prices?bin_platform={platform}"
-
-_market_cache: List[Tuple[float, Dict[int, float]]] = []  # [(ts, {84: price, ...})]
-
-def _get(url: str):
-    return requests.get(url, headers=HEADERS, timeout=20)
-
-def _parse_fodder_html(html: str) -> Dict[int, float]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    data: Dict[int, float] = {}
-    # Heurística: procurar "84 ... 3,200" etc.
-    for rating in (83, 84, 85, 86, 87, 88, 89):
-        m = re.search(rf"\b{rating}\b[^0-9]{{1,10}}([0-9][0-9\., ]{{2,}})", text)
-        if m:
-            val = m.group(1).replace(".", "").replace(",", "").replace(" ", "")
-            try:
-                data[rating] = float(val)
-            except:
-                pass
-    return data
-
-def fetch_fodder_snapshot(platform: str) -> Dict[int, float]:
-    url = FUTBIN_FODDER.format(platform=platform)
-    try:
-        r = _get(url)
-        if r.ok:
-            prices = _parse_fodder_html(r.text)
-            return prices
-    except Exception as e:
-        print("Futbin fetch error:", e)
-    return {}
-
-def pct(old: float | None, new: float | None) -> float:
-    if not old or not new: return 0.0
-    try:
-        return round((new - old) / old * 100.0, 2)
-    except ZeroDivisionError:
-        return 0.0
-
-def record_and_variations() -> Tuple[Dict[int, float], Dict[int, float], Dict[int, float]]:
-    now = time.time()
-    current = fetch_fodder_snapshot(PLATFORM)
-    if not current:
-        return {}, {}, {}
-    _market_cache.append((now, current))
-    _market_cache[:] = _market_cache[-200:]  # limita histórico
-
-    def closest(delta_sec: int) -> Dict[int, float]:
-        target = now - delta_sec
-        best = None
-        for ts, snap in _market_cache:
-            if best is None or abs(ts - target) < abs(best[0] - target):
-                best = (ts, snap)
-        return best[1] if best else {}
-
-    ch1, ch24 = {}, {}
-    snap1 = closest(60*60)
-    snap24 = closest(24*60*60)
-    for r, p in current.items():
-        ch1[r] = pct(snap1.get(r), p) if snap1 else 0.0
-        ch24[r] = pct(snap24.get(r), p) if snap24 else 0.0
-    return current, ch1, ch24
-
-def ascii_spark(series: List[float], width: int = 20) -> str:
-    series = [s for s in series if s is not None]
-    if not series: return ""
-    lo, hi = min(series), max(series)
-    if hi == lo: return "-"*width
-    step = (hi - lo) / width
-    out = []
-    for x in series:
-        pos = int((x - lo) / step) if step else 0
-        pos = max(0, min(width-1, pos))
-        out.append("|" if pos == width-1 else "_")
-    return "".join(out)
-
-# ======================
-# SCAN + ALERTA
-# ======================
-def format_market_block(cur: Dict[int, float], ch1: Dict[int, float], ch24: Dict[int, float]) -> str:
-    def line(r):
-        v = cur.get(r)
-        if v is None: return f"{r}: —"
-        return f"{r}: {int(v):,}  (1h {ch1.get(r,0):+.1f}%, 24h {ch24.get(r,0):+.1f}%)".replace(",", ".")
-    if not cur: return ""
-    # mini tendência com últimos 84s
-    series84 = [snap.get(84) for _, snap in _market_cache][-20:]
-    trend = ascii_spark(series84, width=20) if len(series84) >= 5 else ""
-    block = (
-        f"📊 <b>Fodders ({PLATFORM.upper()})</b>\n"
-        f"{line(83)}\n{line(84)}\n{line(85)}\n"
-    )
-    if trend:
-        block += f"84 trend: <code>{trend}</code>\n"
-    return block
-
-def build_action_hint(item_level: str) -> str:
-    lvl = item_level.lower()
-    if lvl == "high":
-        return "💡 <i>Ação:</i> Se for SBC grande/Upgrade → foco 84–86. Comprar fundo e vender no pico das 1–6h."
-    if lvl == "medium":
-        return "💡 <i>Nota:</i> Pode aquecer fodder 83–85. Snipes abaixo da média e flips rápidos."
-    return "💡 <i>Observação:</i> Monitorizar. Só entrar com margem segura."
-
-def run_scan() -> List[str]:
-    out: List[str] = []
-    # 1) Hypes
-    items = fetch_rss_items()
-    new_items = [i for i in items if i["link"] and i["link"] not in seen_links]
-    for i in new_items:
-        seen_links.add(i["link"])
-    if new_items:
-        save_state()
-
-    # 2) Mercado
-    cur, ch1, ch24 = record_and_variations()
-    market_block = format_market_block(cur, ch1, ch24)
-
-    # 3) Mensagens
-    if not new_items and not cur:
-        return ["Sem sinais fortes agora. A monitorizar…"]
-
-    for it in new_items or []:
-        txt = (
-            f"🚨 <b>HYPE DETECTADO</b> [{it['level'].upper()}]\n"
-            f"Fonte: {it['source']}\n"
-            f"Título: {it['title']}\n"
-            f"Resumo: {it['summary'][:300]}\n"
-            f"🔗 {it['link']}\n\n"
-            f"{market_block}"
-            f"{build_action_hint(it['level'])}"
-        )
-        out.append(txt)
-
-    # Se só houver mercado (sem hype novo)
-    if not new_items and cur:
-        out.append("📊 Atualização de mercado:\n" + market_block)
-
-    return out
-
-# ======================
-# WEBHOOK + JOB
-# ======================
+# ---------- startup/shutdown ----------
 @app.on_event("startup")
-async def startup():
-    load_state()
-    # agenda job periódico
-    scheduler.add_job(hype_job, "interval", minutes=INTERVAL_MIN, next_run_time=None, id="hype_job")
-    scheduler.start()
+async def on_startup():
+    # Define o webhook do Telegram
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    await tg_call("setWebhook", {"url": webhook_url})
+    logger.info(f"Webhook definido para: {webhook_url}")
+    # arranca scheduler (job a cada 10 min)
+    start_scheduler(lambda: asyncio.create_task(run_cycle()))
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    stop_scheduler()
+
+# ---------- ciclo de análise (usado no scheduler) ----------
+async def run_cycle():
+    """
+    1) Vai buscar posts/leaks do X (via Nitter).
+    2) Analisa mercado (Futbin + regras).
+    3) Se houver oportunidades -> envia alerta para subs.
+    """
+    try:
+        posts = await fetch_latest_posts()
+        result = await analyze_market(posts)
+        if result and result.get("signals"):
+            msg = build_signal_message(result)
+            await broadcast(msg)
+            logger.info("Sinais enviados.")
+        else:
+            logger.info("Sem sinais desta vez.")
+    except Exception as e:
+        logger.exception(f"Erro no ciclo de análise: {e}")
+
+# ---------- rotas FastAPI ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "EA Trader AI – Analyst", "interval_min": INTERVAL_MIN}
+    return {"ok": True, "service": "EA Trader AI – Analyst"}
 
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    # valida token no caminho (robusto a trocas de token)
-    if token != TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
+@app.post("/webhook")
+async def telegram_webhook(update: Dict[str, Any]):
+    try:
+        message = update.get("message") or update.get("edited_message") or {}
+        chat_id = message.get("chat", {}).get("id")
+        text = (message.get("text") or "").strip()
 
-    update = await request.json()
-    message = update.get("message") or update.get("edited_message") or {}
-    chat_id = (message.get("chat") or {}).get("id")
-    text = (message.get("text") or "").strip()
+        if not chat_id or not text:
+            return JSONResponse({"ok": True})
 
-    if not chat_id:
-        return {"ok": True}
-
-    if text == "/start":
-        tg_send(chat_id,
+        # comandos
+        lc = text.lower()
+        if lc in ("/start", "start"):
+            await send_message(chat_id,
                 "👋 Olá! Estou online.\n"
                 "Comandos:\n"
-                "/subscribe – começar a receber alertas\n"
-                "/unsubscribe – parar alertas\n"
-                "/status – ver estado\n"
-                "/signal – análise já")
-    elif text == "/help":
-        tg_send(chat_id,
-                "📋 Comandos:\n"
-                "/subscribe\n/unsubscribe\n/status\n/signal")
-    elif text == "/subscribe":
-        subs.add(int(chat_id)); save_state()
-        tg_send(chat_id, "🔔 Subscrito! Vais receber TODOS os hypes + análise de mercado.")
-    elif text == "/unsubscribe":
-        subs.discard(int(chat_id)); save_state()
-        tg_send(chat_id, "🔕 Subscrição removida.")
-    elif text == "/status":
-        tg_send(chat_id, f"✅ Online\nSubscritores: {len(subs)}\nIntervalo: {INTERVAL_MIN} min\nPlataforma: {PLATFORM.upper()}")
-    elif text == "/signal":
-        tg_send(chat_id, "🔎 A analisar…")
-        msgs = run_scan()
-        for m in msgs:
-            tg_send(chat_id, m)
-            time.sleep(0.3)
-    else:
-        tg_send(chat_id, f"Recebi: {text}")
-
-    return {"ok": True}
-
-async def hype_job():
-    if not subs:
-        return
-    msgs = run_scan()
-    for chat_id in list(subs):
-        for m in msgs:
-            tg_send(chat_id, m)
-            await asyncio.sleep(0.2)
+                "/help – ajuda\n"
+                "/status – estado do bot\n"
+                "/subscribe – receber sinais\n"
+                "/unsubscribe – parar sinais\n"
+                "/signal – exemplo de sinal"
+            )
+        elif lc in ("/help", "help"):
+            await send_message(chat_id,
+                "📘 Ajuda:\n"
+                "- Eu monitorizo leaks (FutSheriff, etc.), e preços no Futbin.\n"
+                "- Se vir oportunidade (subida/queda com % e timing), envio alerta 🚨.\n"
+                "- Usa /subscribe para começar a receber os alertas."
+            )
+        elif lc in ("/status", "status"):
+            await send_message(chat_id, get_scheduler_status())
+        elif lc in ("/subscribe", "subscribe"):
+            subs = load_subs()
+            if chat_id not in subs:
+                subs.append(chat_id)
+                save_subs(subs)
+            await send_message(chat_id, "🔔 Subscrito! Vais receber os sinais automáticos.")
+        elif lc in ("/unsubscribe", "unsubscribe"):
+            subs = load_subs()
+            if chat_id in subs:
+                subs.remove(chat_id)
+                save_subs(subs)
+            await send_message(chat_id, "🔕 Subscrição removida.")
+        elif lc in ("/signal", "signal"):
+            # sinal de exemplo (para teste)
+            example = {
+                "signals":[
+                    {"player":"Example Card 86", "action":"BUY", "price":19000,
+                     "reason":"Leak do FutSheriff + volume ↑ + spread baixo",
+                     "tp":23000, "sl":17000, "confidence":82}
+                ]
+            }
+            await send_message(chat_id, build_signal_message(example))
+        else:
+            # eco simples (útil para ver que recebes bem)
+            await send_message(chat_id, f"Recebi: {text}")
+    except Exception as e:
+        logger.exception(f"Erro no webhook: {e}")
+    return JSONResponse({"ok": True})        
