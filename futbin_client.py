@@ -1,65 +1,104 @@
 # futbin_client.py
-import os
-import httpx
+import re
+from typing import Dict, Optional
 from bs4 import BeautifulSoup
+import cloudscraper
 
-LOGIN_URL = "https://www.futbin.com/login"
-TEST_URL = "https://www.futbin.com"
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
-
-async def login_and_check():
+class FutbinClient:
     """
-    Tenta fazer login no Futbin e devolve um resumo (para debug).
-    Nota: Futbin pode alterar o fluxo/CSRF e bloquear bots; isto é só um smoke test.
+    Cliente simples para autenticar no Futbin e fazer pedidos autenticados.
+    - Tenta login com user/password (guardados em env vars).
+    - Se existir FUTBIN_PHPSESSID nas envs, usa diretamente esse cookie.
     """
-    user = os.environ.get("FUTBIN_USER", "")
-    pwd = os.environ.get("FUTBIN_PASS", "")
-    if not user or not pwd:
-        return {"ok": False, "error": "FUTBIN_USER/FUTBIN_PASS em falta"}
 
-    headers = {
-        "User-Agent": UA,
-        "Referer": LOGIN_URL,
-        "Origin": "https://www.futbin.com",
-    }
+    BASE = "https://www.futbin.com"
 
-    async with httpx.AsyncClient(follow_redirects=True, headers=headers, timeout=30) as client:
-        # 1) Ler página de login para tentar obter CSRF (se existir)
-        r_login = await client.get(LOGIN_URL)
-        token = None
-        if r_login.status_code == 200:
-            soup = BeautifulSoup(r_login.text, "html.parser")
-            el = soup.find("input", {"name": "_token"}) or soup.find("input", {"name": "csrf_token"})
-            if el:
-                token = el.get("value")
+    def __init__(self, username: Optional[str] = None, password: Optional[str] = None, phpsessid: Optional[str] = None):
+        self.username = username
+        self.password = password
+        self.phpsessid = phpsessid
+        self.scraper = cloudscraper.create_scraper(browser={"custom": "firefox"})
+        self.logged = False
 
-        # 2) Submeter credenciais
-        data = {
-            "username": user,
-            "password": pwd,
+        # Se já vier um cookie válido, configura-o
+        if self.phpsessid:
+            self.scraper.cookies.set("PHPSESSID", self.phpsessid, domain="www.futbin.com")
+            self.logged = True
+
+    def _get_hidden_inputs(self, html: str) -> Dict[str, str]:
+        soup = BeautifulSoup(html, "lxml")
+        inputs = {}
+        for inp in soup.select("form input[type=hidden]"):
+            name = inp.get("name")
+            val = inp.get("value", "")
+            if name:
+                inputs[name] = val
+        return inputs
+
+    def login(self) -> Dict:
+        """
+        Faz login no Futbin e guarda o cookie na sessão.
+        Retorna dict com status e info útil para debugging.
+        """
+        if self.logged and self.scraper.cookies.get("PHPSESSID", domain="www.futbin.com"):
+            return {"ok": True, "already_logged": True}
+
+        if not self.username or not self.password:
+            return {"ok": False, "error": "MISSING_CREDENTIALS"}
+
+        # 1) Vai à página de login para apanhar tokens
+        login_url = f"{self.BASE}/login"
+        r = self.scraper.get(login_url, timeout=30)
+        if r.status_code != 200:
+            return {"ok": False, "step": "GET_LOGIN", "status": r.status_code}
+
+        hidden = self._get_hidden_inputs(r.text)
+
+        # 2) Monta payload do formulário
+        # Campos mais comuns: username / email / password / csrf
+        payload = {
+            "username": self.username,
+            "password": self.password,
+            # muitos sites usam "remember" (se existir não faz mal enviar)
+            "remember": "on",
         }
-        if token:
-            data["_token"] = token
+        payload.update(hidden)
 
-        r_post = await client.post(LOGIN_URL, data=data)
+        # 3) Faz POST do login
+        post = self.scraper.post(login_url, data=payload, timeout=30, allow_redirects=True)
 
-        # 3) Heurística simples: se já não estamos na /login e conseguimos abrir a homepage autenticados
-        # (isto é frágil, mas serve para debug)
-        authed = (r_post.status_code in (200, 302, 303)) and ("/login" not in str(r_post.url))
+        # 4) Confirma cookie e estado autenticado
+        phpsessid = self.scraper.cookies.get("PHPSESSID", domain="www.futbin.com")
+        home = self.scraper.get(self.BASE, timeout=30)
 
-        # Verificar acesso a uma página pública como teste adicional
-        r_home = await client.get(TEST_URL)
+        ok_home = home.status_code == 200
+        self.logged = bool(phpsessid and ok_home)
 
         return {
-            "ok": True,
-            "login_post_status": r_post.status_code,
-            "final_url": str(r_post.url),
-            "authed_guess": authed,
-            "test_home_status": r_home.status_code,
-            "has_csrf": bool(token),
+            "ok": self.logged,
+            "login_post_status": post.status_code,
+            "test_home_status": home.status_code if ok_home else home.status_code,
+            "has_csrf": bool(hidden),
+            "cookie_set": bool(phpsessid),
+            "final_url": str(post.url),
+            "authed_guess": self.logged,
         }
+
+    def get(self, path: str, params: Optional[Dict] = None):
+        """
+        GET autenticado (ou guest, se sem login). Path pode ser '/something' ou URL completo.
+        """
+        if path.startswith("http"):
+            url = path
+        else:
+            url = self.BASE + path
+        r = self.scraper.get(url, params=params or {}, timeout=30)
+        return r
+
+    # Exemplo de método para ir buscar alguma página de preços (ajusta ao que precisas)
+    def get_player_page(self, player_id: str):
+        """
+        Vai buscar a página de um jogador.
+        """
+        return self.get(f"/{player_id}")
