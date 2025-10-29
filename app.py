@@ -1,78 +1,65 @@
-import os
-import asyncio
-from fastapi import FastAPI, Request, HTTPException
-import httpx
+import os, time, requests
+from fastapi import FastAPI, Request
+from apscheduler.schedulers.background import BackgroundScheduler
+from analyzer import run_scan
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Falta a env TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+BOT_USERNAME   = os.getenv("BOT_USERNAME","")
+CHAT_ID_FIXED  = os.getenv("CHAT_ID","")         # opcional
+SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN","10"))
 
-# Render dá-nos a URL pública nesta env quando está live
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL")  # ex.: https://ea-trader-ai-analyst.onrender.com
-WEBHOOK_PATH = f"/webhook/{TOKEN}"                  # simples “segredo” do webhook
-WEBHOOK_URL = (PUBLIC_URL + WEBHOOK_PATH) if PUBLIC_URL else None
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
+API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 app = FastAPI()
+scheduler = BackgroundScheduler()
+scheduler.start()
 
+LAST_CHAT_ID = None
 
-async def send_message(chat_id: int, text: str):
-    async with httpx.AsyncClient(timeout=20) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage",
-                          json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+def tg_send(chat_id, text):
+    try:
+        requests.post(f"{API}/sendMessage", json={"chat_id": chat_id, "text": text})
+    except Exception as e:
+        print("Send fail:", e)
 
-
-@app.on_event("startup")
-async def setup_webhook():
-    """Define o webhook quando a app arranca (quando a PUBLIC_URL já existe)."""
-    if not WEBHOOK_URL:
-        # Em arranques muito iniciais, a env pode vir vazia. Tentamos mais tarde.
+def broadcast(texts):
+    chat_id = CHAT_ID_FIXED or LAST_CHAT_ID
+    if not chat_id:
+        print("Nenhum chat registado. Usa /start ou define CHAT_ID.")
         return
+    for t in texts:
+        tg_send(chat_id, t)
+        time.sleep(0.4)
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        # Remove qualquer webhook anterior (opcional)
-        await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": ""})
-        # Define o nosso webhook
-        r = await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL})
-        ok = r.json().get("ok")
-        if not ok:
-            # Apenas para veres nos logs se algo falhar
-            print("Falha ao definir webhook:", r.text)
+@app.post("/webhook")
+async def webhook(req: Request):
+    global LAST_CHAT_ID
+    data = await req.json()
+    msg = data.get("message") or data.get("edited_message") or {}
+    chat_id = str(((msg.get("chat") or {}).get("id")) or "")
+    text = (msg.get("text") or "").strip()
+    if chat_id:
+        LAST_CHAT_ID = chat_id
+    if text == "/start":
+        tg_send(chat_id, "👋 Bot ligado.\nComandos:\n/start\n/id\n/signal")
+    elif text == "/id":
+        tg_send(chat_id, f"chat_id: {chat_id}")
+    elif text == "/signal":
+        tg_send(chat_id, "🔎 A analisar…")
+        broadcast(run_scan())
+    else:
+        if text:
+            tg_send(chat_id, f"Recebi: {text}")
+    return {"ok": True}
 
+def scheduled_job():
+    try:
+        broadcast(run_scan())
+    except Exception as e:
+        print("job error:", e)
+
+scheduler.add_job(scheduled_job, "interval", minutes=SCAN_EVERY_MIN, id="scan_job", replace_existing=True)
 
 @app.get("/")
-async def health():
-    return {"status": "ok"}
-
-
-@app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
-    """Recebe updates do Telegram."""
-    if not TOKEN:
-        raise HTTPException(status_code=500, detail="Sem TOKEN")
-
-    data = await request.json()
-
-    # Só lidamos com mensagens de texto simples
-    message = data.get("message") or data.get("edited_message")
-    if not message:
-        return {"ok": True}
-
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    text = (message.get("text") or "").strip()
-
-    if not chat_id:
-        return {"ok": True}
-
-    # Comandos básicos
-    if text.lower().startswith("/start"):
-        await send_message(chat_id, "👋 Olá! O bot está online.\nPodes escrever /help para ver opções.")
-    elif text.lower().startswith("/help"):
-        await send_message(chat_id, "Comandos:\n/start – verificar se estou online\n/help – esta ajuda")
-    else:
-        # Eco simples (podes trocar por lógica do teu projeto)
-        await send_message(chat_id, f"Recebi: {text}")
-
+def root():
     return {"ok": True}
