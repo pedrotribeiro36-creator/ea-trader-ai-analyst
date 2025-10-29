@@ -1,348 +1,266 @@
-import os
+    import os
 import json
-import time
 import asyncio
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
-# ─────────────────────────────────────────────────────────────
-# ▶️ Variáveis de ambiente (obrigações e opcionais)
-# ─────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # obrigatório
-PUBLIC_URL      = os.environ.get("PUBLIC_URL")     # recomendado (https://…onrender.com)
-FREQ_MINUTES    = int(os.environ.get("FREQ_MINUTES", "10"))  # frequência do scheduler
-ADMIN_ID        = os.environ.get("ADMIN_ID")  # opcional: chat id teu para logs
-# Conectores opcionais (se não tiver, o conector fica “mute”)
-X_BEARER_TOKEN  = os.environ.get("X_BEARER_TOKEN")      # API oficial do X
-IG_APP_TOKEN    = os.environ.get("IG_APP_TOKEN")        # Instagram Graph API
+# ---------- Config ----------
+SERVICE_NAME = "EA Trader AI – Analyst"
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN nas variáveis de ambiente do Render.")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # ex.: https://ea-trader-ai-analyst.onrender.com
+ANALYZE_EVERY_MIN = int(os.getenv("ANALYZE_EVERY_MIN", "10"))
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-SUBS_FILE = "subs.json"  # persistência simples (reinicio pode limpar em Render free)
+# Ficheiro para persistir subscritores (persistência simples)
+SUBS_FILE = "subscribers.json"
 
-app = FastAPI(title="EA Trader AI – Analyst (one-file)")
+# ---------- Futbin helper (opcional) ----------
+try:
+    from futbin_client import login_and_check as futbin_login_and_check  # já fornecido antes
+except Exception:
+    futbin_login_and_check = None  # se o ficheiro ainda não existir
 
-# ─────────────────────────────────────────────────────────────
-# 🗄️ Subs (persistência simples)
-# ─────────────────────────────────────────────────────────────
-def load_subs() -> List[int]:
+# ---------- App ----------
+app = FastAPI(title=SERVICE_NAME, version="1.0.0")
+http = httpx.AsyncClient(timeout=30.0)
+
+# ---------- Utilitários de subscrição ----------
+def _load_subscribers() -> List[int]:
     try:
-        with open(SUBS_FILE, "r") as f:
+        with open(SUBS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return []
 
-def save_subs(subs: List[int]) -> None:
+
+def _save_subscribers(chat_ids: List[int]) -> None:
     try:
-        with open(SUBS_FILE, "w") as f:
-            json.dump(subs, f)
+        with open(SUBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(chat_ids, f)
     except Exception:
         pass
 
-SUBSCRIBERS: List[int] = load_subs()
 
-# ─────────────────────────────────────────────────────────────
-# 📤 Telegram helpers
-# ─────────────────────────────────────────────────────────────
-async def tg(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
+# ---------- Telegram ----------
+def _tg_api(method: str) -> str:
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN não configurado.")
+    return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+
+
+async def tg_send_message(chat_id: int, text: str, disable_preview: bool = True):
+    url = _tg_api("sendMessage")
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": disable_preview}
+    try:
+        await http.post(url, json=payload)
+    except Exception:
+        pass
+
+
+async def tg_set_webhook() -> Dict[str, Any]:
+    if not TELEGRAM_TOKEN or not BASE_URL:
+        return {"ok": False, "detail": "Falta TELEGRAM_TOKEN ou BASE_URL"}
+
+    webhook_url = f"{BASE_URL}/webhook/{TELEGRAM_TOKEN}"
+    # remove e volta a definir para evitar webhooks antigos
+    try:
+        await http.get(_tg_api("deleteWebhook"))
+    except Exception:
+        pass
+    r = await http.get(_tg_api("setWebhook"), params={"url": webhook_url})
+    try:
         return r.json()
+    except Exception:
+        return {"ok": False, "detail": f"Resposta inesperada: {r.text[:200]}"}
 
-async def send_msg(chat_id: int, text: str, preview: bool=False):
-    await tg("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": not preview,
-        "parse_mode": "HTML",
-    })
 
-async def broadcast(text: str):
-    for cid in list(SUBSCRIBERS):
-        try:
-            await send_msg(cid, text)
-        except Exception:
-            pass
+# ---------- “Análise” (placeholder) ----------
+async def fetch_market_snapshot() -> Dict[str, Any]:
+    """
+    Aqui ficará a tua lógica real de análise (Futbin/X/etc.).
+    Por agora é um 'mock' que devolve um resumo com timestamp.
+    """
+    # TODO: substituir por análise real (scraping APIs próprias/legais)
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "summary": "Mercado está estável; sem desvios > ±2% nas últimas 24h.",
+        "top_opportunity": None,
+    }
 
-# ─────────────────────────────────────────────────────────────
-# 🌐 Webhook
-# ─────────────────────────────────────────────────────────────
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "EA Trader AI – Analyst ok"
 
-@app.post("/webhook")
-async def webhook(req: Request):
-    update = await req.json()
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
+async def analyze_and_broadcast():
+    subs = _load_subscribers()
+    if not subs:
+        return  # ninguém para notificar
+
+    snapshot = await fetch_market_snapshot()
+    txt = (
+        "📊 *Atualização de Mercado*\n"
+        f"⏱ {snapshot['timestamp']}\n"
+        f"Resumo: {snapshot['summary']}\n"
+        f"Oportunidade: {snapshot['top_opportunity'] or '—'}"
+    )
+    # envia para todos (silenciosamente ignora erros)
+    await asyncio.gather(*(tg_send_message(cid, txt, True) for cid in subs))
+
+
+# ---------- Scheduler ----------
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+scheduler = AsyncIOScheduler()
+JOB_ID = "market_job"
+
+
+def _start_scheduler():
+    if scheduler.get_job(JOB_ID):
+        scheduler.remove_job(JOB_ID)
+    trigger = IntervalTrigger(minutes=max(1, ANALYZE_EVERY_MIN))
+    scheduler.add_job(analyze_and_broadcast, trigger=trigger, id=JOB_ID, replace_existing=True)
+    if not scheduler.running:
+        scheduler.start()
+
+
+def _next_run_iso() -> Optional[str]:
+    job = scheduler.get_job(JOB_ID)
+    if job and job.next_run_time:
+        return job.next_run_time.isoformat()
+    return None
+
+
+# ---------- FastAPI rotas ----------
+@app.get("/", tags=["health"])
+async def root():
+    return {"status": "ok", "service": SERVICE_NAME}
+
+
+@app.get("/health", tags=["health"])
+async def health():
+    return {"ok": True}
+
+
+@app.get("/status", tags=["status"])
+async def status():
+    return {
+        "scheduler_active": scheduler.running,
+        "frequency_min": ANALYZE_EVERY_MIN,
+        "next_run": _next_run_iso(),
+        "subscribers_count": len(_load_subscribers()),
+        "webhook_set": bool(TELEGRAM_TOKEN and BASE_URL),
+    }
+
+
+@app.get("/futbin/test", tags=["futbin"])
+async def futbin_test():
+    if futbin_login_and_check is None:
+        raise HTTPException(status_code=500, detail="futbin_client.py não encontrado.")
+    user = os.getenv("FUTBIN_USER")
+    pw = os.getenv("FUTBIN_PASS")
+    if not user or not pw:
+        raise HTTPException(status_code=500, detail="FUTBIN_USER/FUTBIN_PASS não definidos.")
+    # correr de forma síncrona num thread para não bloquear o loop
+    from functools import partial
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, partial(futbin_login_and_check, user, pw))
+    # 200 se ok, caso contrário 502 (bad gateway/rede)
+    status_code = 200 if result.get("ok") else 502
+    return JSONResponse(status_code=status_code, content=result)
+
+
+# ---------- Telegram webhook ----------
+@app.post("/webhook/{token}", tags=["telegram"])
+async def tg_webhook(token: str, request: Request):
+    if token != TELEGRAM_TOKEN:
+        raise HTTPException(status_code=401, detail="Token inválido.")
+
+    payload = await request.json()
+    message = payload.get("message") or payload.get("edited_message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (message.get("text") or "").strip()
+
+    if not chat_id or not text:
         return {"ok": True}
 
-    chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
-
+    # Comandos
     if text.lower() in ("/start", "start"):
-        await send_msg(chat_id, "👋 Olá! O bot está online.\nEscreve /help para ver opções.")
+        subs = _load_subscribers()
+        if chat_id not in subs:
+            subs.append(chat_id)
+            _save_subscribers(subs)
+        await tg_send_message(
+            chat_id,
+            "👋 Olá! O bot está online.\n"
+            "Usa /help para ver opções. Estás subscrito às notificações.",
+        )
         return {"ok": True}
 
     if text.lower() in ("/help", "help"):
-        await send_msg(chat_id,
+        await tg_send_message(
+            chat_id,
             "Comandos:\n"
-            "/status – estado do scheduler\n"
+            "/start – ativar e subscrever\n"
+            "/help – esta ajuda\n"
+            "/status – ver estado do bot\n"
             "/subscribe – receber sinais\n"
             "/unsubscribe – parar sinais\n"
-            "/signal – forçar análise agora")
+            "/signal – enviar um sinal de teste",
+        )
         return {"ok": True}
 
     if text.lower() in ("/subscribe", "subscribe"):
-        if chat_id not in SUBSCRIBERS:
-            SUBSCRIBERS.append(chat_id)
-            save_subs(SUBSCRIBERS)
-        await send_msg(chat_id, "✅ Subscreveste os sinais.")
+        subs = _load_subscribers()
+        if chat_id not in subs:
+            subs.append(chat_id)
+            _save_subscribers(subs)
+        await tg_send_message(chat_id, "✅ Subscrito. Irás receber atualizações periódicas.")
         return {"ok": True}
 
     if text.lower() in ("/unsubscribe", "unsubscribe"):
-        if chat_id in SUBSCRIBERS:
-            SUBSCRIBERS.remove(chat_id)
-            save_subs(SUBSCRIBERS)
-        await send_msg(chat_id, "🚫 Cancelaste a subscrição.")
+        subs = [cid for cid in _load_subscribers() if cid != chat_id]
+        _save_subscribers(subs)
+        await tg_send_message(chat_id, "❎ Subscrição cancelada. Podes voltar com /subscribe.")
         return {"ok": True}
 
     if text.lower() in ("/status", "status"):
-        nxt = _next_run_str()
-        await send_msg(chat_id, f"🟢 Scheduler ativo.\nPróxima análise: {nxt}\nFrequência: {FREQ_MINUTES} min")
+        await tg_send_message(
+            chat_id,
+            f"🟢 Scheduler ativo\n"
+            f"Próxima análise: {(_next_run_iso() or 'N/D')}\n"
+            f"Frequência: {ANALYZE_EVERY_MIN} min",
+        )
         return {"ok": True}
 
-    if text.lower() in ("/signal", "signal"):
-        await send_msg(chat_id, "⏳ A analisar…")
-        signals = await analyze_market()
-        if signals:
-            for s in signals:
-                await send_msg(chat_id, s, preview=True)
-        else:
-            await send_msg(chat_id, "⚪ Sem oportunidades neste momento.")
+    if text.lower().startswith("/signal"):
+        # Sinal manual de teste
+        await tg_send_message(chat_id, "📣 Sinal de teste: (apenas um exemplo).")
         return {"ok": True}
 
-    # eco simples (para debug)
-    await send_msg(chat_id, f"Recebi: {text}")
+    # eco simples para qualquer outro texto
+    await tg_send_message(chat_id, f"Recebi: {text}")
     return {"ok": True}
 
-# ─────────────────────────────────────────────────────────────
-# 🔗 Auto-set do webhook ao arrancar (se PUBLIC_URL existir)
-# ─────────────────────────────────────────────────────────────
+
+# ---------- Eventos de arranque/fecho ----------
 @app.on_event("startup")
 async def on_startup():
-    if PUBLIC_URL:
-        try:
-            await tg("setWebhook", {"url": f"{PUBLIC_URL}/webhook"})
-        except Exception:
-            pass
-    # arranca o scheduler loop
-    asyncio.create_task(_scheduler_loop())
-
-# ─────────────────────────────────────────────────────────────
-# ⏱️ Scheduler “lite” (loop asyncio)
-# ─────────────────────────────────────────────────────────────
-_next_run: Optional[datetime] = None
-
-def _next_run_str() -> str:
-    global _next_run
-    if not _next_run:
-        return "N/D"
-    return _next_run.strftime("%H:%M")
-
-async def _scheduler_loop():
-    global _next_run
-    # dá 5s para o Render “assentar”
-    await asyncio.sleep(5)
-    while True:
-        try:
-            # marca próxima corrida
-            _next_run = datetime.utcnow() + timedelta(minutes=FREQ_MINUTES)
-            # espera até lá
-            await asyncio.sleep(FREQ_MINUTES * 60)
-
-            # corre análise
-            signals = await analyze_market()
-            if signals:
-                header = f"📈 Sinais ({datetime.utcnow().strftime('%H:%M')} UTC):"
-                await broadcast(header)
-                for s in signals:
-                    await broadcast(s)
-        except Exception as e:
-            if ADMIN_ID:
-                try:
-                    await send_msg(int(ADMIN_ID), f"⚠️ Erro no scheduler: {e}")
-                except Exception:
-                    pass
-            await asyncio.sleep(5)  # backoff curto
-
-# ─────────────────────────────────────────────────────────────
-# 🧠 Análise de mercado (plug-and-play)
-# ─────────────────────────────────────────────────────────────
-async def analyze_market() -> List[str]:
-    """
-    Agrega dados de múltiplas fontes.
-    - Se X/IG tokens existirem, usa conectores.
-    - Caso contrário, usa stubs/dados públicos simples.
-    Retorna lista de mensagens formatadas para envio no Telegram.
-    """
-    candidates: List[Dict[str, Any]] = []
-
-    # 1) Conector X (opcional)
-    if X_BEARER_TOKEN:
-        tw = await fetch_x_signals(["FutSheriff", "Fut_scoreboard", "Fut_Camp"], minutes=30)
-        candidates.extend(tw)
-
-    # 2) Conector Instagram (opcional)
-    if IG_APP_TOKEN:
-        ig = await fetch_ig_posts(["fut_scoreboard"], minutes=30)
-        candidates.extend(ig)
-
-    # 3) Futbin / Fut.gg (placeholder)
-    fb = await fetch_futbin_topmovers()
-    candidates.extend(fb)
-
-    # 4) Regras simples (exemplo) → transforma em mensagens
-    signals: List[str] = []
-    for c in candidates:
-        # regra de exemplo: variação >= 8% nas últimas 1–3h
-        pct = c.get("change_pct", 0)
-        if pct >= 8:
-            name = c.get("name", "Ativo")
-            price = c.get("price", "?")
-            src = c.get("src", "mercado")
-            url = c.get("url", "")
-            msg = (
-                f"<b>🟢 Oportunidade</b>\n"
-                f"{name} subiu <b>{pct:.1f}%</b> • Preço: {price}\n"
-                f"Fonte: {src}\n"
-                f"{url}"
-            )
-            signals.append(msg)
-
-    # se não houver nada, mas queres validar, envia demo 1x/dia
-    return signals
-
-# ─────────────────────────────────────────────────────────────
-# 🔌 Conectores (mínimos/placeholder)
-# ─────────────────────────────────────────────────────────────
-async def fetch_x_signals(handles: List[str], minutes: int=30) -> List[Dict[str, Any]]:
-    """
-    Precisa de X_BEARER_TOKEN válido (API oficial). Se não houver, retorna [].
-    Implementação simplificada: devolve estrutura compatível com a “regra”.
-    """
-    if not X_BEARER_TOKEN:
-        return []
-    # Exemplo mínimo (não chama endpoints reais aqui por simplicidade)
-    # Podes implementar GET search/recent com query "from:handle (palavras-chave)"
-    return []  # implementar se forneceres o token oficial
-
-async def fetch_ig_posts(accounts: List[str], minutes: int=30) -> List[Dict[str, Any]]:
-    if not IG_APP_TOKEN:
-        return []
-    return []  # implementar se forneceres o token oficial
-
-async def fetch_futbin_topmovers() -> List[Dict[str, Any]]:
-    """
-    Placeholder: sem API pública; scraping pode violar ToS.
-    Aqui devolvemos um “exemplo” fictício para validar o fluxo.
-    Substitui por uma API tua/planilha/webhook próprio quando quiseres.
-    """
-    # Exemplo “mock” (para veres o bot a enviar algo quando houver variação >= 8%)
-    demo = [
-        {"name": "FUT Card XYZ", "price": "18,250", "change_pct": 9.4, "src": "Futbin (mock)", "url": "https://www.futbin.com/"},
-        {"name": "FUT Card ABC", "price": "22,000", "change_pct": 3.1, "src": "Futbin (mock)", "url": "https://www.futbin.com/"},
-    ]
-    return demo
-    # app.py (adiciona os imports)
-from fastapi import FastAPI
-from futbin_client import login_and_check   # <--- novo import
-
-# ... o teu FastAPI existente ...
-
-@app.get("/debug/futbin")
-async def debug_futbin():
+    # arranca o scheduler
+    _start_scheduler()
+    # tenta configurar o webhook
     try:
-        result = await login_and_check()
-        return result
+        res = await tg_set_webhook()
+        print("Webhook set result:", res)
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-    import os
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        print("Falha ao definir webhook:", str(e))
 
-# ⬇️ novo
-from futbin_client import FutbinClient
 
-app = FastAPI(title="EA Trader AI – Analyst")
-
-# ====== ENV VARS obrigatórias/úteis ======
-TELEGRAM_API = os.getenv("TELEGRAM_API")  # já usas isto
-FUTBIN_USER = os.getenv("FUTBIN_USER")
-FUTBIN_PASS = os.getenv("FUTBIN_PASS")
-FUTBIN_PHPSESSID = os.getenv("FUTBIN_PHPSESSID")  # opcional: se quiseres continuar a usar cookie direto
-
-# Cliente Futbin (username/password OU cookie)
-futbin = FutbinClient(username=FUTBIN_USER, password=FUTBIN_PASS, phpsessid=FUTBIN_PHPSESSID)
-
-# ====== SCHEDULER ======
-scheduler = AsyncIOScheduler()
-
-async def analyze_job():
-    """
-    Job que corre de X em X minutos: garante login e faz uma chamada simples ao Futbin.
-    Aqui podes substituir pela tua análise (raspagem, cálculo, sinais, etc).
-    """
-    # Garante login (se tiver cookie ou já estiver logado, não faz nada)
-    login_info = futbin.login()
-
-    # Exemplo de chamada: homepage (como teste de “vida”)
-    r = futbin.get("/")
-    ok = r.status_code == 200
-
-    return {
-        "login_ok": login_info.get("ok"),
-        "http_ok": ok,
-        "status": r.status_code,
-    }
-
-# arranque do scheduler (10 min)
-scheduler.add_job(analyze_job, "interval", minutes=10, id="market_analysis", replace_existing=True)
-scheduler.start()
-
-# ====== ROTAS AUXILIARES ======
-@app.get("/")
-async def root():
-    return {"ok": True, "msg": "EA Trader AI – Analyst is running."}
-
-@app.get("/futbin/test")
-async def futbin_test():
-    """
-    Testa o login e devolve um pequeno resumo.
-    """
-    info = futbin.login()
-    test = futbin.get("/")
-    return JSONResponse({
-        "login": info,
-        "home_status": test.status_code,
-        "final_url": str(test.url),
-    })
-
-@app.get("/futbin/login")
-async def futbin_login():
-    """
-    Força novo login (útil para debugging).
-    """
-    futbin.scraper.cookies.clear()  # limpa cookies e força relogin
-    info = futbin.login()
-    return JSONResponse(info)
-
-# (Mantém as tuas rotas /webhook do Telegram, /status, etc.)
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await http.aclose()
+    except Exception:
+        pass                    
