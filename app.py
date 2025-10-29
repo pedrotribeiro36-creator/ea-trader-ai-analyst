@@ -261,3 +261,17 @@ async def fetch_futbin_topmovers() -> List[Dict[str, Any]]:
         {"name": "FUT Card ABC", "price": "22,000", "change_pct": 3.1, "src": "Futbin (mock)", "url": "https://www.futbin.com/"},
     ]
     return demo
+    # app.py (adiciona os imports)
+from fastapi import FastAPI
+from futbin_client import login_and_check   # <--- novo import
+
+# ... o teu FastAPI existente ...
+
+@app.get("/debug/futbin")
+async def debug_futbin():
+    try:
+        result = await login_and_check()
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
